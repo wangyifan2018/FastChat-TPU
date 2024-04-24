@@ -45,6 +45,7 @@ from fastchat.modules.gptq import GptqConfig, load_gptq_quantized
 from fastchat.utils import get_gpu_memory
 
 from fastchat.model.chatglm3 import Chatglm3
+from fastchat.model.qwen import Qwen
 # Check an environment variable to check if we should be sharing Peft model
 # weights.  When false we treat all Peft models as separate.
 peft_share_base_weights = (
@@ -199,8 +200,18 @@ def load_model(
     import accelerate
 
     if device == "tpu":
-        model = Chatglm3(model_path, dev_id)
-        tokenizer = model.sp
+        model_path_basename = os.path.basename(os.path.normpath(model_path))
+        if model_path_basename == "qwen-7b-chat":
+            model = Qwen(model_path, dev_id)
+            tokenizer = model.sp
+        elif model_path_basename == "chatglm3-6b":
+            model = Chatglm3(model_path, dev_id)
+            tokenizer = model.sp
+        else:
+            model = Chatglm3(model_path, dev_id)
+            tokenizer = model.sp
+            if debug:
+                print("model name error, use Chatglm3")
         return model, tokenizer
 
     # get model adapter

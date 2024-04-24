@@ -7,13 +7,16 @@
 # third-party components.
 #
 #===----------------------------------------------------------------------===#
+import re
+import time
 from transformers import AutoTokenizer
 import numpy as np
-import time
-import re
 import logging
 import sophon.sail as sail
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
+
+from typing import Tuple, List
+from transformers import PreTrainedTokenizer
 
 
 #convert sail_dtype to numpy dtype
@@ -39,47 +42,120 @@ def fp16_cast(arr:np.ndarray):
         return arr
 
 
-class Chatglm3:
-    def __init__(self, model_path, dev_id=0):
-        bmodel_path = model_path + "/chatglm3-6b_int4_1dev_2k.bmodel"
+def make_context(
+    tokenizer: PreTrainedTokenizer,
+    query: str,
+    history: List[Tuple[str, str]] = None,
+    system: str = "",
+    max_window_size: int = 6144,
+    chat_format: str = "chatml",
+):
+    if history is None:
+        history = []
+
+    if chat_format == "chatml":
+        im_start, im_end = "<|im_start|>", "<|im_end|>"
+        im_start_tokens = [tokenizer.im_start_id]
+        im_end_tokens = [tokenizer.im_end_id]
+        nl_tokens = tokenizer.encode("\n")
+
+        def _tokenize_str(role, content):
+            return f"{role}\n{content}", tokenizer.encode(
+                role, allowed_special=set()
+            ) + nl_tokens + tokenizer.encode(content, allowed_special=set())
+
+        system_text, system_tokens_part = _tokenize_str("system", system)
+        system_tokens = im_start_tokens + system_tokens_part + im_end_tokens
+
+        raw_text = ""
+        context_tokens = []
+
+        for turn_query, turn_response in reversed(history):
+            query_text, query_tokens_part = _tokenize_str("user", turn_query)
+            query_tokens = im_start_tokens + query_tokens_part + im_end_tokens
+            response_text, response_tokens_part = _tokenize_str(
+                "assistant", turn_response
+            )
+            response_tokens = im_start_tokens + response_tokens_part + im_end_tokens
+
+            next_context_tokens = nl_tokens + query_tokens + nl_tokens + response_tokens
+            prev_chat = (
+                f"\n{im_start}{query_text}{im_end}\n{im_start}{response_text}{im_end}"
+            )
+
+            current_context_size = (
+                len(system_tokens) + len(next_context_tokens) + len(context_tokens)
+            )
+            if current_context_size < max_window_size:
+                context_tokens = next_context_tokens + context_tokens
+                raw_text = prev_chat + raw_text
+            else:
+                break
+
+        context_tokens = system_tokens + context_tokens
+        raw_text = f"{im_start}{system_text}{im_end}" + raw_text
+        context_tokens += (
+            nl_tokens
+            + im_start_tokens
+            + _tokenize_str("user", query)[1]
+            + im_end_tokens
+            + nl_tokens
+            + im_start_tokens
+            + tokenizer.encode("assistant")
+            + nl_tokens
+        )
+        raw_text += f"\n{im_start}user\n{query}{im_end}\n{im_start}assistant\n"
+
+    elif chat_format == "raw":
+        raw_text = query
+        context_tokens = tokenizer.encode(raw_text)
+    else:
+        raise NotImplementedError(f"Unknown chat format {chat_format!r}")
+
+    return context_tokens
+
+
+class Qwen:
+    def __init__(self, model_path, dev_id = 0):
+        bmodel_path = model_path + "/qwen-7b_int4_1dev_2k.bmodel"
         token_path = model_path
-        # load tokenizer
         self.input_str = ""
-        self.system = [{"role":"system",
-                        "content":"You are ChatGLM3, a large language model trained by Zhipu.AI. Follow the user's instructions carefully. Respond using markdown."}]
+        self.system_prompt = "You are QWEN, a large language model. Follow the user's instructions carefully."
         self.history = []
+
+        # load tokenizer
         self.sp = AutoTokenizer.from_pretrained(token_path, trust_remote_code=True)
-        logging.info("load {} success!".format(token_path))
         # warm up
         self.sp.decode([0])
-        self.EOS = self.sp.eos_token_id
+        self.EOS = self.sp.im_end_id
 
         # load bmodel
         # 这里devio，后面都没有创建系统内存的tensor
         self.net = sail.Engine(bmodel_path, dev_id, sail.IOMode.DEVIO)
-        logging.info("load {} success, dev_id {}".format(bmodel_path, dev_id))
+        logging.info("load {} success!".format(bmodel_path))
         self.handle = sail.Handle(dev_id)
         self.graph_names = self.net.get_graph_names()
 
-        # initialize glm parameters
+        # initialize qwen parameters
         self.NUM_LAYERS = (len(self.graph_names) - 2) // 2
         self.first_hidden_input_shape = self.net.get_input_shape("block_0", self.net.get_input_names("block_0")[0])
-        self.SEQLEN, _, self.HIDDEN_SIZE = self.first_hidden_input_shape
+        _, self.SEQLEN, self.HIDDEN_SIZE = self.first_hidden_input_shape
 
+        # initialize net name
         self.name_embed = "embedding"
         self.name_embed_cache = "embedding_cache"
         self.name_lm = "lm_head"
         self.name_blocks = ["block_"+str(i) for i in range(self.NUM_LAYERS)]
         self.name_blocks_cache = ["block_cache_"+str(i) for i in range(self.NUM_LAYERS)]
 
-        # tensors:
+        # initialize tensors (inputs & outputs)
         # forward_first: embedding_tensor
         self.first_embed_input = self.init_sail_tensor(self.name_embed, 0, [1, self.SEQLEN])
         self.first_embed_output = self.init_sail_tensor(self.name_embed, 0, [1, self.SEQLEN, self.HIDDEN_SIZE], False)
 
         # forward_next: embedding_tensor
         self.next_embed_input = self.init_sail_tensor(self.name_embed_cache, 0, [1, 1])
-        self.next_embed_output = self.init_sail_tensor(self.name_embed_cache, 0, [1,  1, self.HIDDEN_SIZE], False)
+        self.next_embed_output = self.init_sail_tensor(self.name_embed_cache, 0, [1,  self.HIDDEN_SIZE], False)
 
         # forward_first: hidden_state
         self.first_hidden_input = self.init_sail_tensor(self.name_blocks[0], 0)
@@ -89,7 +165,7 @@ class Chatglm3:
         self.next_hidden_input = self.init_sail_tensor(self.name_blocks_cache[0], 0)
         self.next_hidden_output = self.init_sail_tensor(self.name_blocks_cache[0], 0, None, False)
 
-        # forward_first: position_id_tensor 和 attention_mask_tensor
+        # forward_first: position_id_tensor and attention_mask_tensor
         self.first_pid = self.init_sail_tensor(self.name_blocks[0], 1)
         self.first_attention = self.init_sail_tensor(self.name_blocks[0], 2)
 
@@ -101,21 +177,19 @@ class Chatglm3:
         self.present_key = self.init_sail_tensor(self.name_blocks_cache[0], 1, None, False)
         self.present_value = self.init_sail_tensor(self.name_blocks_cache[0], 2, None, False)
 
-        # forward_first: key_tensor 和 value_tensor
+        # forward_first: key_tensor and value_tensor
         self.past_key_output = []
         self.past_value_output = []
 
-        # forward_next: cache block的kv tensor名
+        # forward_next: kv cache block
         self.cache_key_input = []
         self.cache_key_output = []
         self.cache_value_input = []
         self.cache_value_output = []
 
-        for i in range(self.NUM_LAYERS):
+        for _ in range(self.NUM_LAYERS):
             self.past_key_output.append(self.init_sail_tensor(self.name_blocks[0], 1, None, False))
             self.past_value_output.append(self.init_sail_tensor(self.name_blocks[0], 2, None, False))
-            self.past_key_output[i]["data"].memory_set(0)
-            self.past_value_output[i]["data"].memory_set(0)
 
             self.cache_key_input.append(self.init_sail_tensor(self.name_blocks_cache[0], 3))
             self.cache_key_output.append(self.init_sail_tensor(self.name_blocks_cache[0], 1, None, False))
@@ -128,7 +202,6 @@ class Chatglm3:
         self.lm_output = self.init_sail_tensor(self.name_lm, 0, None, False)
 
         self.token_length = 0
-        self.round = 0
 
     def init_sail_tensor(self, name, tensor_idx, shape=None, is_input=True):
         """
@@ -155,51 +228,49 @@ class Chatglm3:
             tensor["data"] = sail.Tensor(self.handle, tensor["shape"], tensor["dtype"], False, True)
         return tensor
 
-
+    # inference for the first token
     def forward_first(self, token):
-        # Keep
         input_ids = np.zeros(self.SEQLEN, type_convert(self.first_embed_input["dtype"]))
         input_ids[:min(self.SEQLEN, len(token))] = token
-        self.token_length = len(token)
         input_ids = input_ids.reshape(1, -1)
-
+        self.token_length = len(token)
         position_id = np.zeros(self.SEQLEN, type_convert(self.first_pid["dtype"]))
         for i in range(self.token_length):
             position_id[i] = i
 
-        attention_mask = np.zeros(self.SEQLEN*self.SEQLEN, type_convert(self.first_attention["dtype"])) #这里的type要从模型获取。
-        for i in range(self.SEQLEN):
+        attention_mask = np.ones(self.SEQLEN*self.SEQLEN, type_convert(self.first_attention["dtype"])) * (-10000.0)
+        for i in range(self.token_length):
             for j in range(self.SEQLEN):
-                if not (j <= i and i < self.token_length):
-                    attention_mask[i*self.SEQLEN + j] = -10000.0
+                if (j <= i):
+                    attention_mask[i*self.SEQLEN + j] = 0
+
         # embedding
-        self.first_embed_input["data"].update_data(fp16_cast(input_ids))
+        self.first_embed_input["data"].update_data(input_ids)
         input_embed_tensors = {self.first_embed_input["name"]: self.first_embed_input["data"]}
         output_embed_tensors = {self.first_embed_output["name"]: self.first_embed_output["data"]}
+
+        # Embedding Layer Inference
         self.net.process(self.name_embed, input_embed_tensors, output_embed_tensors)
 
         # blocks
         self.first_hidden_tensor = self.first_embed_output["data"]
         self.first_hidden_tensor.reshape(self.first_hidden_input["shape"])
-        self.first_pid["data"].update_data(fp16_cast(position_id.reshape(self.first_pid["shape"])))
-        self.first_attention["data"].update_data(fp16_cast(attention_mask.reshape(self.first_attention["shape"])))
+        self.first_pid["data"].update_data(position_id.reshape(self.first_pid["shape"]))
+        self.first_attention["data"].update_data(fp16_cast(attention_mask.reshape(self.first_attention["shape"]))) # set bf16 in the future.
 
         input_blocks_tensors = {self.first_hidden_input["name"]: self.first_hidden_tensor,
                                 self.first_pid["name"]: self.first_pid["data"],
                                 self.first_attention["name"]: self.first_attention["data"]}
 
+        # Transformer Block Inference
         for i in range(self.NUM_LAYERS):
             output_blocks_tensors = {self.first_hidden_output["name"]: self.first_hidden_tensor,
-                                    self.past_key_output[i]["name"]: self.present_key["data"],
-                                    self.past_value_output[i]["name"]: self.present_value["data"],}
+                                    self.past_key_output[i]["name"]: self.past_key_output[i]["data"],
+                                    self.past_value_output[i]["name"]: self.past_value_output[i]["data"]}
+
             self.net.process(self.name_blocks[i], input_blocks_tensors, output_blocks_tensors)
 
-            unit_size = np.prod(self.present_key["shape"][1:])
-            self.past_key_output[i]["data"].sync_d2d(self.present_key["data"], 0, (self.SEQLEN - self.token_length)*unit_size, self.token_length * unit_size)
-            self.past_value_output[i]["data"].sync_d2d(self.present_value["data"], 0, (self.SEQLEN - self.token_length)*unit_size, self.token_length * unit_size)
-
-        # lm_head
-        # hidden_states 的最后一个位置的元素取出来作为 lm_head的输入
+        # get the last token info as Lm head input
         copy_len = self.first_hidden_tensor.shape()[-1]
         self.lm_input["data"].sync_d2d(self.first_hidden_tensor,
                                       (self.token_length-1)* copy_len,
@@ -209,12 +280,14 @@ class Chatglm3:
         input_lm_tensors = {self.lm_input["name"]: self.lm_input["data"]}
         output_lm_tensors = {self.lm_output["name"]: self.lm_output["data"]}
 
+        # Lm_head Inference
         self.net.process(self.name_lm, input_lm_tensors, output_lm_tensors)
         return int(self.lm_output["data"].asnumpy())
 
+    # The following tokens prediction
     def forward_next(self, ):
         attention_mask = np.zeros(self.SEQLEN+1, type_convert(self.next_attention["dtype"]))
-        for i in range(self.SEQLEN - self.token_length + 1):
+        for i in range(self.token_length-1, self.SEQLEN):
             attention_mask[i] = -10000.0
         position_id = np.array(self.token_length - 1, type_convert(self.next_pid["dtype"]))
 
@@ -224,15 +297,17 @@ class Chatglm3:
 
         input_embed_tensors = {self.next_embed_input["name"]: self.next_embed_input["data"]}
         output_embed_tensors = {self.next_embed_output["name"]: self.next_embed_output["data"]}
+        # Embedding Layer Inference
         self.net.process(self.name_embed_cache, input_embed_tensors, output_embed_tensors)
 
         # blocks
-        self.next_pid["data"].update_data(fp16_cast(position_id.reshape(self.next_pid["shape"])))
+        self.next_pid["data"].update_data(position_id.reshape(self.next_pid["shape"]))
         self.next_attention["data"].update_data(fp16_cast(attention_mask.reshape(self.next_attention["shape"])))
 
         self.next_hidden_tensor = self.next_embed_output["data"]
         self.next_hidden_tensor.reshape(self.next_hidden_input["shape"])
 
+        # Transformer Block Inference
         for i in range(self.NUM_LAYERS):
             inputs_block_cache_tensors = {self.next_hidden_input["name"]: self.next_hidden_tensor,
                                         self.next_pid["name"]: self.next_pid["data"],
@@ -240,22 +315,28 @@ class Chatglm3:
                                         self.cache_key_input[i]["name"]: self.past_key_output[i]["data"],
                                         self.cache_value_input[i]["name"]: self.past_value_output[i]["data"]}
             outputs_block_cache_tensors = {self.next_hidden_output["name"]: self.next_hidden_tensor,
-                                        self.cache_key_output[i]["name"]: self.past_key_output[i]["data"],
-                                        self.cache_value_output[i]["name"]: self.past_value_output[i]["data"]}
+                                        self.cache_key_output[i]["name"]: self.present_key["data"],
+                                        self.cache_value_output[i]["name"]: self.present_value["data"]}
             self.net.process(self.name_blocks_cache[i], inputs_block_cache_tensors, outputs_block_cache_tensors)
+
+            # update kv_cache()
+            unit_size = self.present_key["shape"][-1]*self.present_key["shape"][-2]
+            self.past_key_output[i]["data"].sync_d2d(self.present_key["data"], 0, (self.token_length-1)*unit_size, unit_size)
+            self.past_value_output[i]["data"].sync_d2d(self.present_value["data"], 0, (self.token_length-1)*unit_size, unit_size)
 
         self.lm_input_tensor = self.next_hidden_tensor
         self.lm_input_tensor.reshape(self.lm_input["shape"])
 
         input_lm_tensors = {self.lm_input["name"]: self.lm_input_tensor}
         output_lm_tensors = {self.lm_output["name"]: self.lm_output["data"]}
-        self.net.process(self.name_lm, input_lm_tensors, output_lm_tensors)
-        return int(self.lm_output["data"].asnumpy()) #int32
 
+        # Lm_head Inference
+        self.net.process(self.name_lm, input_lm_tensors, output_lm_tensors)
+        return int(self.lm_output["data"].asnumpy())
 
     def recover_message_list(self, prompt):
         role_token_pattern = "|".join(
-            [re.escape(r) for r in ["<|system|>", "<|user|>", "<|assistant|>"]]
+            [re.escape(r) for r in ["<|im_start|>system", "<|im_start|>user", "<|im_start|>assistant"]]
         )
         role = None
         last_end_idx = -1
@@ -263,13 +344,15 @@ class Chatglm3:
         for match in re.finditer(role_token_pattern, prompt):
             if role:
                 messge = {}
-                if role == "<|system|>":
+                if role == "<|im_start|>system":
                     messge["role"] = "system"
-                elif role == "<|user|>":
+                elif role == "<|im_start|>user":
                     messge["role"] = "user"
                 else:
                     messge["role"] = "assistant"
                 messge["content"] = prompt[last_end_idx + 1 : match.start()]
+                if messge["content"].endswith("<|im_end|>\n"):
+                    messge["content"] = messge["content"][:-len("<|im_end|>\n")]
                 message_list.append(messge)
 
             role = prompt[match.start() : match.end()]
@@ -278,25 +361,25 @@ class Chatglm3:
         return message_list
 
     def stream_predict(self, prompt):
-        # import pdb; pdb.set_trace()
         message_list = self.recover_message_list(prompt)
-        tokens = self.sp.build_chat_input(
-            query=message_list[-1]["content"], history=message_list[:-1], role="user"
-        )
+        tokens = make_context(self.sp,
+                                message_list[-1]["content"],
+                                history=[[m["role"], m["content"]] for m in message_list[:-1]],
+                                system=self.system_prompt,
+                                max_window_size=self.SEQLEN,
+                                chat_format="chatml")
         tok_num = 0
         answer_cur = []
-        # input is empty
+
         if not tokens:
             logging.error("Sorry: your question is too wierd!!")
             return
-        if len(tokens) > self.SEQLEN:
-            logging.warning("The maximum question length should be shorter than {} but we get {} instead, \
-                history will be cleared, please ask again".format(self.SEQLEN, len(tokens)))
+        if self.token_length > self.SEQLEN:
+            logging.error("The maximum question length should be shorter than {} but we get {} instead.".format(self.SEQLEN, self.token_length))
             return
 
-        first_start = time.time()
+        # First token
         token = self.forward_first(tokens)
-        first_end = time.time()
         pre_token = 30910
         pre_ids = [pre_token]
         pre_word= self.sp.decode(pre_ids)
@@ -307,17 +390,6 @@ class Chatglm3:
             diff = word[len(pre_word):]
             answer_cur += [token]
             yield self.sp.decode(answer_cur)
-            # print(word, flush=True, end='')
             self.token_length += 1
             tok_num += 1
             token = self.forward_next()
-
-        # 计时
-        # next_end = time.time()
-        # first_duration = first_end-first_start
-        # next_duration = next_end-first_end
-        # tps = tok_num / next_duration
-
-        # print()
-        # print(f"FTL: {first_duration:.3f} s")
-        # print(f"TPS: {tps:.3f} token/s")
