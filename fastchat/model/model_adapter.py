@@ -46,6 +46,7 @@ from fastchat.utils import get_gpu_memory
 
 from fastchat.model.chatglm3 import Chatglm3
 from fastchat.model.qwen import Qwen
+from fastchat.model.codefuse import CodeFuse
 # Check an environment variable to check if we should be sharing Peft model
 # weights.  When false we treat all Peft models as separate.
 peft_share_base_weights = (
@@ -198,11 +199,13 @@ def load_model(
 ):
     """Load a model from Hugging Face."""
     import accelerate
-
     if device == "tpu":
         model_path_basename = os.path.basename(os.path.normpath(model_path))
         if model_path_basename == "qwen-7b-chat":
             model = Qwen(model_path, dev_id)
+            tokenizer = model.sp
+        elif model_path_basename == "codefuse-devops-model-7b-chat":
+            model = CodeFuse(model_path, dev_id)
             tokenizer = model.sp
         elif model_path_basename == "chatglm3-6b":
             model = Chatglm3(model_path, dev_id)
@@ -1743,6 +1746,81 @@ class QwenChatAdapter(BaseModelAdapter):
 
     def get_default_conv_template(self, model_path: str) -> Conversation:
         return get_conv_template("qwen-7b-chat")
+
+
+
+class QwenChatAdapter(BaseModelAdapter):
+    """The model adapter for CodeFuse-DevOps-Model-7B-Chat
+    To run this model, you need to ensure additional flash attention installation:
+    ``` bash
+    git clone https://github.com/Dao-AILab/flash-attention
+    cd flash-attention && pip install .
+    pip install csrc/layer_norm
+    pip install csrc/rotary
+    ```
+
+    Since from 2.0, the following change happened
+    - `flash_attn_unpadded_func` -> `flash_attn_varlen_func`
+    - `flash_attn_unpadded_qkvpacked_func` -> `flash_attn_varlen_qkvpacked_func`
+    - `flash_attn_unpadded_kvpacked_func` -> `flash_attn_varlen_kvpacked_func`
+    You may need to revise the code in: https://huggingface.co/codefuse-ai/CodeFuse-DevOps-Model-7B-Chat
+    to from flash_attn.flash_attn_interface import flash_attn_varlen_func as flash_attn_unpadded_func
+    """
+
+    def match(self, model_path: str):
+        return "codefuse" in model_path.lower()
+
+    def float_set(self, config, option):
+        config.bf16 = False
+        config.fp16 = False
+        config.fp32 = False
+
+        if option == "bf16":
+            config.bf16 = True
+        elif option == "fp16":
+            config.fp16 = True
+        elif option == "fp32":
+            config.fp32 = True
+        else:
+            print("Invalid option. Please choose one from 'bf16', 'fp16' and 'fp32'.")
+
+    def load_model(self, model_path: str, from_pretrained_kwargs: dict):
+        from transformers.generation import GenerationConfig
+
+        revision = from_pretrained_kwargs.get("revision", "main")
+        config = AutoConfig.from_pretrained(
+            model_path,
+            trust_remote_code=True,
+        )
+        # NOTE: if you use the old version of model file, please remove the comments below
+        # config.use_flash_attn = False
+        self.float_set(config, "fp16")
+        generation_config = GenerationConfig.from_pretrained(
+            model_path, trust_remote_code=True
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            config=config,
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+            **from_pretrained_kwargs,
+        ).eval()
+        if hasattr(model.config, "use_dynamic_ntk") and model.config.use_dynamic_ntk:
+            model.config.max_sequence_length = 16384
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path, trust_remote_code=True, revision=revision
+        )
+        tokenizer.eos_token_id = config.eos_token_id
+        tokenizer.bos_token_id = config.bos_token_id
+        tokenizer.pad_token_id = generation_config.pad_token_id
+        model.config.eos_token_id = tokenizer.eos_token_id
+        model.config.bos_token_id = tokenizer.bos_token_id
+        model.config.pad_token_id = tokenizer.pad_token_id
+
+        return model, tokenizer
+
+    def get_default_conv_template(self, model_path: str) -> Conversation:
+        return get_conv_template("codefuse-devops-model-7b-chat")
 
 
 class BGEAdapter(BaseModelAdapter):

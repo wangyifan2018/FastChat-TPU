@@ -536,6 +536,13 @@ register_model_info(
 )
 
 register_model_info(
+    ["CodeFuse-DevOps-Model-7B-Chat"],
+    "Qwen",
+    "https://huggingface.co/codefuse-ai/CodeFuse-DevOps-Model-7B-Chat",
+    "A multi-language large-scale language model (LLM), a Chinese DevOps large model, mainly dedicated to exerting practical value in the field of DevOps. Currently, DevOps-Model can help engineers answer questions encountered in the all DevOps life cycle.",
+)
+
+register_model_info(
     ["Llama2-Chinese-13b-Chat", "LLama2-Chinese-13B"],
     "Llama2-Chinese",
     "https://huggingface.co/FlagAlpha/Llama2-Chinese-13b-Chat",

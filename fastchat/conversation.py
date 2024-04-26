@@ -1214,7 +1214,7 @@ register_conv_template(
     Conversation(
         name="qwen-7b-chat",
         system_template="<|im_start|>system\n{system_message}",
-        system_message="You are a helpful assistant.",
+        system_message='You are a helpful, intelligent assistant AI named "Qwen", a conversational chatbot that can follow instructions, converse with the user, and perform a variety of tasks, including tasks on knowledge, reasoning, mathematics, and code. Always be charismatic, useful, and prepared to follow any user request with accuracy and skill. You should respond with high quality, fluent, and detailed responses. Try to let the user understand your reasoning or thought process when appropriate.',
         roles=("<|im_start|>user", "<|im_start|>assistant"),
         sep_style=SeparatorStyle.CHATML,
         sep="<|im_end|>",
@@ -1226,6 +1226,27 @@ register_conv_template(
         stop_str="<|endoftext|>",
     )
 )
+
+
+# /CodeFuse-DevOps-Model-7B-Chat default template
+# source: https://huggingface.co/codefuse-ai/CodeFuse-DevOps-Model-7B-Chat
+register_conv_template(
+    Conversation(
+        name="codefuse-devops-model-7b-chat",
+        system_template="<|im_start|>system\n{system_message}",
+        system_message='You are a helpful, intelligent assistant AI named "CodeFuse", a conversational chatbot that can follow instructions, converse with the user, and perform a variety of tasks, including tasks on knowledge, reasoning, mathematics, and code. Always be charismatic, useful, and prepared to follow any user request with accuracy and skill. You should respond with high quality, fluent, and detailed responses. Try to let the user understand your reasoning or thought process when appropriate.',
+        roles=("<|im_start|>user", "<|im_start|>assistant"),
+        sep_style=SeparatorStyle.CHATML,
+        sep="<|im_end|>",
+        stop_token_ids=[
+            151643,
+            151644,
+            151645,
+        ],  # "<|endoftext|>", "<|im_start|>", "<|im_end|>"
+        stop_str="<|endoftext|>",
+    )
+)
+
 
 # source: https://huggingface.co/01-ai/Yi-34B-Chat/blob/main/tokenizer_config.json#L60
 register_conv_template(
@@ -1416,7 +1437,7 @@ register_conv_template(
     Conversation(
         name="metharme",
         system_template="<|system|>{system_message}",
-        system_message="""Enter RP mode. You shall reply to the user while staying 
+        system_message="""Enter RP mode. You shall reply to the user while staying
         in character. Your responses must be detailed, creative, immersive, and drive the scenario
         forward.""",
         roles=("<|user|>", "<|model|>"),
